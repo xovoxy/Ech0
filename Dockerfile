@@ -1,64 +1,71 @@
-# =================== 构建阶段 ===================
-FROM alpine:latest AS builder
+# =================== 前端构建阶段 ===================
+FROM --platform=linux/amd64 node:22-alpine AS frontend-builder
+
+WORKDIR /web
+
+# 复制前端 package 与锁文件（避免拷贝 npm 的 package-lock.json）
+COPY web/package.json web/pnpm-lock.yaml ./
+
+# 启用 corepack 并使用项目声明的 pnpm 版本
+RUN corepack enable
+
+# 安装依赖
+RUN pnpm install --frozen-lockfile
+
+# 复制前端源代码
+COPY web/ .
+
+# 构建前端
+RUN pnpm run build --mode production
+
+# =================== 后端构建阶段 ===================
+FROM --platform=linux/amd64 golang:1.25.1-alpine AS backend-builder
+
+# 安装必要的工具
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev
 
 WORKDIR /app
-ENV TZ=Asia/Shanghai
 
-# 获取构建平台信息
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETVARIANT
+# 复制go mod文件
+COPY go.mod go.sum ./
 
-# 创建数据目录
-RUN mkdir -p /app/data
+# 下载依赖
+RUN go mod download
 
-# 创建备份目录
-RUN mkdir -p /app/backup
+# 复制源代码
+COPY . .
+COPY --from=frontend-builder /template/dist /app/template/dist
 
-# 创建数据目录(embed版无需手动创建template)
-# RUN mkdir -p /app/data && \
-#     mkdir -p /app/template
-
-# 将所有平台的 ech0 二进制复制进镜像(embed版无需复制前端资源)
-COPY /backend-artifacts/* /tmp/
-
-# 将所有平台的 ech0 二进制和前端资源复制进镜像
-# COPY /backend-artifacts/* /tmp/
-# COPY /frontend-asset/frontend.tar.gz /tmp/
-
-# 解压对应平台的 ech0 二进制
-RUN mkdir -p /app/template && \
-    if [ "$TARGETOS" = "linux" ] && [ "$TARGETARCH" = "amd64" ]; then \
-       tar -xzf /tmp/ech0-linux-amd64.tar.gz -C /tmp && mv /tmp/ech0-linux-amd64 /app/ech0; \
-    elif [ "$TARGETOS" = "linux" ] && [ "$TARGETARCH" = "arm64" ]; then \
-       tar -xzf /tmp/ech0-linux-arm64.tar.gz -C /tmp && mv /tmp/ech0-linux-arm64 /app/ech0; \
-    elif [ "$TARGETOS" = "linux" ] && [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
-       tar -xzf /tmp/ech0-linux-armv7.tar.gz -C /tmp && mv /tmp/ech0-linux-armv7 /app/ech0; \
-    else \
-       echo "Unsupported platform: $TARGETOS/$TARGETARCH$TARGETVARIANT" && exit 1; \
-    fi && \
-    # 解压前端静态资源到 /app/template
-   #  tar -xzf /tmp/frontend.tar.gz -C /app/template && \
-    # 清理临时文件
-    rm -rf /tmp/*
+# 构建后端二进制文件 - 使用静态链接
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+    -tags netgo \
+    -ldflags="-linkmode external -extldflags '-static' -w -s" \
+    -o ech0 ./main.go
 
 # =================== 最终镜像 ===================
-# FROM debian:bookworm-slim
-FROM alpine:latest
+FROM --platform=linux/amd64 alpine:latest
+
+# 安装必要的运行时依赖
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
+
+# 设置时区
 ENV TZ=Asia/Shanghai
 
-COPY --from=builder /app /app
+# 创建必要的目录
+RUN mkdir -p /app/data /app/backup /app/template
 
-RUN ls -lh /app
+# 从后端构建阶段复制二进制文件
+COPY --from=backend-builder /app/ech0 /app/ech0
 
-# 设置 ech0 二进制文件的权限
+# 设置权限
 RUN chmod +x /app/ech0
 
+# 暴露端口
 EXPOSE 6277
 EXPOSE 6278
 
+# 启动命令
 ENTRYPOINT ["/app/ech0"]
-
 CMD ["serve"]
